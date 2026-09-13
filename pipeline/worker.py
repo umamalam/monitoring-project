@@ -1,8 +1,21 @@
 """
 worker.py
-Runs on Render as a free "Web Service" -- internally runs two background
-threads: a Kafka consumer (Redpanda -> OpenSearch) and an anomaly detector
-(z-score on rolling metric windows -> alerts).
+Runs on Render as a free "Web Service" (Render's free tier doesn't include
+background workers, only web services) -- but internally it runs two real
+background threads:
+  1. Kafka consumer: reads app-logs from Redpanda, indexes into
+     OpenSearch (Bonsai), and rolls up 1-minute metric windows.
+  2. Anomaly detector: every 30s, queries OpenSearch aggregations for the
+     latest window per service, compares against a rolling z-score baseline,
+     and writes alerts back into OpenSearch.
+
+The Flask app itself just exposes /health (so Render/UptimeRobot can keep it
+alive) and /alerts (so Grafana or a quick check can see current alerts
+without needing direct ES access).
+
+This "single process, multiple background threads" pattern is a real,
+legitimate design choice for fitting a pipeline into a constrained free-tier
+environment -- worth explaining exactly like that in an interview.
 """
 
 import json
@@ -43,6 +56,9 @@ def get_kafka_consumer():
     })
 
 
+# ---------------------------------------------------------------------------
+# Thread 1: Kafka consumer -> OpenSearch (logs + rolled-up metric windows)
+# ---------------------------------------------------------------------------
 def consumer_loop():
     es = get_es_client()
     consumer = get_kafka_consumer()
@@ -104,6 +120,9 @@ def flush_window(es, window_start, buckets):
     print(f"[consumer] flushed window starting {window_start}, services: {list(buckets.keys())}")
 
 
+# ---------------------------------------------------------------------------
+# Thread 2: Anomaly detector -> reads metric_windows, writes alerts
+# ---------------------------------------------------------------------------
 def get_recent_windows(es, service, limit):
     resp = es.search(index="metric_windows", body={
         "query": {"term": {"service": service}},
@@ -142,7 +161,8 @@ def check_metric(es, service, metric_name, latest_value, history_values):
             "baseline": mean, "z_score": z, "severity": severity,
             "resolved": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "message": f"{service}: {metric_name} = {latest_value:.2f} (baseline {mean:.2f}, z={z:.1f})",
+            "message": f"{service}: {metric_name} = {latest_value:.2f} "
+                       f"(baseline {mean:.2f}, z={z:.1f})",
         }
         if active:
             es.update(index="alerts", id=active["_id"], body={"doc": doc})
@@ -157,7 +177,8 @@ def check_metric(es, service, metric_name, latest_value, history_values):
 def detector_loop():
     es = get_es_client()
     _status["detector"] = "running"
-    print(f"[detector] running, checking every {CHECK_INTERVAL_SECONDS}s")
+    print("[detector] running, checking every "
+          f"{CHECK_INTERVAL_SECONDS}s against last {BASELINE_WINDOW_COUNT} windows")
 
     while True:
         try:
@@ -183,6 +204,9 @@ def detector_loop():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
+# ---------------------------------------------------------------------------
+# Flask routes (health check for Render/UptimeRobot, quick alerts view)
+# ---------------------------------------------------------------------------
 @app.route("/health")
 def health():
     return jsonify(_status), 200
@@ -197,6 +221,155 @@ def alerts():
         "size": 50,
     })
     return jsonify([hit["_source"] for hit in resp["hits"]["hits"]]), 200
+
+
+@app.route("/api/metrics")
+def api_metrics():
+    """Returns recent metric windows per service, for the dashboard's charts."""
+    es = get_es_client()
+    resp = es.search(index="metric_windows", body={
+        "query": {"range": {"window_start": {"gte": "now-2h"}}},
+        "sort": [{"window_start": "asc"}],
+        "size": 500,
+    })
+    windows = [hit["_source"] for hit in resp["hits"]["hits"]]
+
+    by_service = defaultdict(list)
+    for w in windows:
+        by_service[w["service"]].append({
+            "t": w["window_start"],
+            "error_rate": w["error_rate"],
+            "avg_latency_ms": w["avg_latency_ms"],
+            "request_count": w["request_count"],
+        })
+    return jsonify(by_service), 200
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    es = get_es_client()
+    resp = es.search(index="alerts", body={
+        "query": {"term": {"resolved": False}},
+        "sort": [{"created_at": "desc"}],
+        "size": 50,
+    })
+    return jsonify([hit["_source"] for hit in resp["hits"]["hits"]]), 200
+
+
+@app.route("/dashboard")
+def dashboard():
+    return DASHBOARD_HTML
+
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Incident Monitor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-adapter-moment/1.0.1/chartjs-adapter-moment.min.js"></script>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #0d1117; color: #e6edf3; margin: 0; padding: 24px; }
+    h1 { font-size: 22px; margin-bottom: 4px; }
+    .sub { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+    .cards { display: flex; gap: 16px; margin-bottom: 24px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; flex: 1; }
+    .card .num { font-size: 28px; font-weight: 700; }
+    .card .label { color: #8b949e; font-size: 13px; }
+    .critical { color: #f85149; }
+    .ok { color: #3fb950; }
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+    .chart-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+    .chart-box h3 { margin: 0 0 12px 0; font-size: 14px; color: #c9d1d9; }
+    canvas { max-height: 280px; }
+    .alert-row { background: #2d1a1a; border-left: 3px solid #f85149; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; font-size: 13px; }
+    .no-alerts { color: #3fb950; padding: 10px 14px; }
+  </style>
+</head>
+<body>
+  <h1>📡 Incident Monitor</h1>
+  <div class="sub">Live view over OpenSearch — refreshes every 10s</div>
+
+  <div class="cards">
+    <div class="card"><div class="num" id="alert-count">-</div><div class="label">Active alerts</div></div>
+    <div class="card"><div class="num" id="req-count">-</div><div class="label">Requests (last 2h)</div></div>
+    <div class="card"><div class="num" id="service-count">-</div><div class="label">Services reporting</div></div>
+  </div>
+
+  <div id="alerts-section"></div>
+
+  <div class="charts">
+    <div class="chart-box"><h3>Error rate by service</h3><canvas id="errorChart"></canvas></div>
+    <div class="chart-box"><h3>Average latency (ms) by service</h3><canvas id="latencyChart"></canvas></div>
+  </div>
+
+  <script>
+    const colors = ['#58a6ff', '#3fb950', '#f0883e', '#a371f7', '#f85149', '#39c5cf'];
+    let errorChart, latencyChart;
+
+    function makeChart(ctx, label) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: { datasets: [] },
+        options: {
+          responsive: true,
+          scales: {
+            x: { type: 'time', time: { unit: 'minute' }, ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+            y: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' }, beginAtZero: true }
+          },
+          plugins: { legend: { labels: { color: '#c9d1d9' } } }
+        }
+      });
+    }
+
+    async function refresh() {
+      const [metricsRes, alertsRes] = await Promise.all([
+        fetch('/api/metrics'), fetch('/api/alerts')
+      ]);
+      const metrics = await metricsRes.json();
+      const alerts = await alertsRes.json();
+
+      const services = Object.keys(metrics);
+      document.getElementById('service-count').textContent = services.length;
+      document.getElementById('alert-count').textContent = alerts.length;
+      document.getElementById('alert-count').className = 'num ' + (alerts.length > 0 ? 'critical' : 'ok');
+
+      let totalReq = 0;
+      services.forEach(s => metrics[s].forEach(w => totalReq += w.request_count));
+      document.getElementById('req-count').textContent = totalReq;
+
+      const alertSection = document.getElementById('alerts-section');
+      if (alerts.length === 0) {
+        alertSection.innerHTML = '<div class="no-alerts">✅ No active anomalies</div>';
+      } else {
+        alertSection.innerHTML = alerts.map(a =>
+          `<div class="alert-row"><b>${a.severity.toUpperCase()}</b> — ${a.message}</div>`
+        ).join('');
+      }
+
+      if (!errorChart) {
+        errorChart = makeChart(document.getElementById('errorChart'), 'error_rate');
+        latencyChart = makeChart(document.getElementById('latencyChart'), 'latency');
+      }
+
+      errorChart.data.datasets = services.map((s, i) => ({
+        label: s, borderColor: colors[i % colors.length], data: metrics[s].map(w => ({x: w.t, y: w.error_rate})), tension: 0.3
+      }));
+      latencyChart.data.datasets = services.map((s, i) => ({
+        label: s, borderColor: colors[i % colors.length], data: metrics[s].map(w => ({x: w.t, y: w.avg_latency_ms})), tension: 0.3
+      }));
+      errorChart.update();
+      latencyChart.update();
+    }
+
+    refresh();
+    setInterval(refresh, 10000);
+  </script>
+</body>
+</html>
+"""
 
 
 def start_background_threads():
