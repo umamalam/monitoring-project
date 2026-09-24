@@ -1,91 +1,215 @@
-# Real-Time System Monitoring Pipeline
+# Predictive Infrastructure Monitoring
 
-A real-time monitoring system that ingests application logs through a streaming pipeline, stores them for analysis, and detects anomalies using statistical baselining -- built to mirror how production observability stacks work at a small scale.
+A monitoring pipeline for a multi-endpoint Flask service, built on Kafka and
+Elasticsearch, with two detection layers and a forecasting layer:
+
+- **Reactive detection** -- flags a metric that is abnormal right now
+  (rolling z-score, plus an Isolation Forest model over the combined metric
+  set for anomalies no single metric shows on its own)
+- **Predictive forecasting** -- fits a trend to a metric's recent history
+  and projects forward to estimate when it will cross a configured
+  threshold, with a confidence interval and cross-metric corroboration
+- **Accuracy tracking** -- checks past predictions against what actually
+  happened, so prediction quality is a measured number, not a claim
+
+The demo application includes two real, reproducible failure modes: an
+unindexed query that slows down as data grows, and a connection pool that
+slowly leaks under load and will eventually hit its configured limit. The
+pipeline is built to catch both -- the first reactively, the second before
+it happens.
 
 ## Architecture
 
-Flask App (real endpoints, real bugs)
-        |  produces events
-        v
-   Apache Kafka (Redpanda Serverless)
-        |  consumed by background worker
-        v
-   OpenSearch (log storage + metric aggregation)
-        |
-        v
-   Anomaly Detector (rolling z-score on error rate and latency)
-        |
-        v
-   Grafana (dashboards and visualization)
+```
+Flask app (demo-app) --> Kafka (Upstash) --> pipeline worker --> Elasticsearch (Bonsai) --> Grafana
+                                                   |
+                                    ingest / detector / ml_detector
+                                    / predictor / accuracy
+```
 
-## What it does
+The pipeline worker runs as a single Flask process with five background
+threads (Render's free tier only supports Web Services, not Background
+Workers):
 
-- A Flask application exposes several endpoints (/products, /login, /checkout, /search) with realistic behavior: variable latency, and genuine failure modes on /checkout (timeouts and upstream errors), rather than randomly injected fake errors.
-- Every request is logged as a structured JSON event and published directly to a Kafka topic.
-- A worker service consumes the stream, indexes raw logs into OpenSearch, and rolls events up into one-minute metric windows per service (request count, error rate, average and p95 latency).
-- An anomaly detector runs alongside the consumer, comparing each new window against a rolling baseline (mean and standard deviation of recent windows) and raising an alert when error rate or latency deviates significantly (z-score thresholding).
-- A load generator simulates realistic traffic patterns for testing and demos.
-
-## Tech stack
-
-- Backend: Python, Flask
-- Streaming: Apache Kafka (via Redpanda Serverless)
-- Storage: OpenSearch (via Bonsai)
-- Visualization: Grafana Cloud
-- Deployment: Docker, Render
+| Thread | File | Role |
+|---|---|---|
+| Ingest | `ingest.py` | Consumes Kafka, writes raw logs, rolls request/gauge events into a unified `timeseries` index |
+| Reactive detector | `detector.py` | Rolling z-score per metric |
+| ML detector | `ml_detector.py` | Isolation Forest over each service's combined metrics |
+| Predictor | `predictor.py` | Trend forecast + threshold crossing + confidence |
+| Accuracy tracker | `accuracy.py` | Confirms or invalidates past predictions |
 
 ## Project structure
 
+```
 demo-app/
-  app.py              - Flask app and Kafka producer
-  load_generator.py   - Traffic simulator
-  console_consumer.py - Lightweight terminal-based live stats viewer
-  Dockerfile
-
+  app.py            Flask app: product listing, search, login, checkout
+                     (with a real unindexed-scan slowdown and a real
+                     connection leak), health check
 pipeline/
-  worker.py           - Kafka consumer and anomaly detector (runs as background threads)
-  kafka_client.py
-  es_client.py
-  locustfile.py       - Load testing
-  Dockerfile
+  ingest.py          Kafka consumer, log/metric ingestion
+  detector.py         Reactive z-score alerting
+  ml_detector.py       Isolation Forest multivariate anomaly detection
+  forecaster.py         Trend fitting (linear regression / Holt smoothing)
+  correlate.py           Cross-metric corroboration
+  predictor.py            Threshold-crossing predictions
+  accuracy.py              Prediction outcome tracking
+  es_client.py              Elasticsearch index management and queries
+  kafka_client.py            Kafka producer/consumer config
+  worker.py                   Flask app + background thread orchestration
+  thresholds.json              Per-metric threshold configuration
+  locustfile.py                  Load test traffic generator
+docker-compose.local.yml    Local Kafka + Elasticsearch for development
+```
 
-## Running locally
+## Tech stack
 
-1. Set up a Kafka topic and an OpenSearch index (Redpanda Serverless and Bonsai both have free tiers).
+Python, Flask, Kafka (Upstash), Elasticsearch (Bonsai), Grafana Cloud,
+scikit-learn, statsmodels, NumPy, Docker, Render, Locust.
 
-2. Start the app:
+## Local development
 
+Requires Docker.
+
+```bash
+docker compose -f docker-compose.local.yml up -d
+```
+
+Terminal 1:
+```bash
 cd demo-app
 pip install -r requirements.txt
-export KAFKA_BOOTSTRAP_SERVERS="..."
-export KAFKA_USERNAME="..."
-export KAFKA_PASSWORD="..."
+export UPSTASH_KAFKA_BOOTSTRAP_SERVER=localhost:9092
+export KAFKA_SECURITY_PROTOCOL=PLAINTEXT
+export APP_LOG_PATH=/tmp/app.log
 python3 app.py
+```
 
-3. Start the worker:
-
+Terminal 2:
+```bash
 cd pipeline
 pip install -r requirements.txt
-export KAFKA_BOOTSTRAP_SERVERS="..."
-export KAFKA_USERNAME="..."
-export KAFKA_PASSWORD="..."
-export BONSAI_URL="https://user:pass@your-cluster.bonsaisearch.net"
+export UPSTASH_KAFKA_BOOTSTRAP_SERVER=localhost:9092
+export KAFKA_SECURITY_PROTOCOL=PLAINTEXT
+export BONSAI_URL=http://localhost:9200
 python3 worker.py
+```
 
-4. Generate traffic:
+Terminal 3 (load generator):
+```bash
+cd pipeline
+pip install -r requirements-dev.txt
+locust -f locustfile.py --host http://localhost:5000
+```
+Open `http://localhost:8089` and start a run with 40-50 users.
 
-cd demo-app
-python3 load_generator.py --duration 300
+To see predictions appear faster during development, the demo app accepts:
+`MAX_CONNECTIONS`, `CONNECTION_LEAK_RATE`, `CONNECTION_REPORT_INTERVAL_SECONDS`;
+the worker accepts `DETECTOR_INTERVAL_SECONDS`, `PREDICTOR_INTERVAL_SECONDS`,
+`ACCURACY_INTERVAL_SECONDS`, `WINDOW_SECONDS`.
 
-## Design notes
+## Deployment
 
-- The Kafka consumer and anomaly detector run as background threads inside a single Flask process rather than as separate services. This was a deliberate choice to fit within a free-tier hosting constraint, traded off against the fact that a crash in one thread can affect the other -- acceptable for this scale, not how it would be structured with a larger infrastructure budget.
-- Anomaly detection uses a single-metric rolling z-score rather than a multivariate model. It is simple and explainable, at the cost of not catching correlated anomalies across multiple metrics -- a natural next step would be an Isolation Forest or autoencoder trained on multiple features jointly.
-- Free-tier managed services (Kafka, OpenSearch) impose message and storage limits that are fine for demonstration traffic but would need upgrading for production volume.
+### 1. Kafka -- Upstash
 
-## Possible extensions
+Create a free cluster at [console.upstash.com](https://console.upstash.com)
+and a topic named `app-logs`. From the cluster page, note the bootstrap
+endpoint, username, and password.
 
-- Multivariate anomaly detection (Isolation Forest or autoencoder)
-- Root-cause correlation: surfacing the top error messages from the window that triggered an alert
-- Alert routing to Slack or PagerDuty via webhook
-- Swapping OpenSearch for a dedicated time-series store for the metrics path
+### 2. Elasticsearch -- Bonsai
+
+Create a free Sandbox cluster at [bonsai.io](https://bonsai.io). The
+cluster URL includes credentials.
+
+### 3. Render
+
+Deploy `demo-app` and `pipeline` as two separate Web Services from the same
+repository (root directory set accordingly for each; both use their
+included Dockerfile).
+
+`demo-app` environment variables:
+```
+UPSTASH_KAFKA_BOOTSTRAP_SERVER
+UPSTASH_KAFKA_USERNAME
+UPSTASH_KAFKA_PASSWORD
+```
+
+`pipeline` environment variables:
+```
+UPSTASH_KAFKA_BOOTSTRAP_SERVER
+UPSTASH_KAFKA_USERNAME
+UPSTASH_KAFKA_PASSWORD
+BONSAI_URL
+```
+
+Render's free tier spins services down after 15 minutes of inactivity;
+[UptimeRobot](https://uptimerobot.com) pinging each service's `/health`
+endpoint keeps them warm.
+
+### 4. Grafana Cloud
+
+Add an Elasticsearch data source pointed at the Bonsai URL, index
+`timeseries`. Suggested panels:
+
+| Panel | Index | Filter |
+|---|---|---|
+| Error rate by service | `timeseries` | `metric: error_rate` |
+| Latency by service | `timeseries` | `metric: avg_latency_ms` |
+| Active alerts | `alerts` | `resolved: false` |
+| Predicted issues | `predictions` | `resolved: false`, sorted by `hours_until_threshold` |
+| Connection trend | `timeseries` | `metric: active_connections` |
+
+## API
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Service and thread status |
+| `GET /alerts` | Active reactive alerts (`?source=zscore` or `?source=isolation_forest`) |
+| `GET /predictions` | Active predictions, sorted by urgency |
+| `GET /predictions/accuracy` | Aggregate prediction accuracy |
+
+## How prediction works
+
+`forecaster.py` fits ordinary least-squares regression to a metric's recent
+history, upgrading to Holt's exponential smoothing once enough windows
+exist (20+). The fit's residual spread produces a confidence interval on
+the projected threshold-crossing time.
+
+`correlate.py` checks whether other metrics for the same service are
+trending in the same direction at the same time; agreement across metrics
+raises the prediction's confidence score.
+
+`predictor.py` combines both for every metric with a configured threshold
+(`thresholds.json`) and writes a prediction with a threshold-crossing
+estimate, confidence level, and supporting metrics.
+
+`accuracy.py` checks predictions after their time window has passed and
+records whether the metric actually crossed the threshold, and by how many
+hours the estimate was off.
+
+`ml_detector.py` standardizes every metric a service reports and fits an
+Isolation Forest per detection cycle, flagging windows where the combined
+metric state is unusual even if no single metric crosses its own z-score
+threshold.
+
+## Limitations
+
+- Free-tier Kafka/Elasticsearch have message and storage caps.
+- Render's free tier spins down without traffic; UptimeRobot is a
+  workaround, not a fix.
+- The z-score detector evaluates one metric at a time; `ml_detector.py`
+  covers correlated multi-metric cases but is unsupervised, retrained from
+  scratch each cycle, and not validated against labeled incident data.
+- The predictive layer is trend extrapolation, not a learned model --
+  it assumes the recent rate of change continues, and will miss sudden
+  step-changes (a deploy that instantly doubles error rate, for example).
+- Cross-metric correlation checks trend direction only, not statistical or
+  causal correlation, and can be misled by metrics that happen to drift
+  together for unrelated reasons.
+- Confidence thresholds (`forecaster.py`'s spread-ratio cutoffs,
+  `correlate.py`'s per-signal boost, `ml_detector.py`'s contamination
+  parameter) are fixed constants, not tuned against real incident data.
+- All five pipeline threads run in one process; a crash in one can take
+  down the others.
+- The demo app's connection pool is in-process memory and only behaves
+  correctly with a single app instance (`gunicorn --workers 1`).

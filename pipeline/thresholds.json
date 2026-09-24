@@ -1,0 +1,28 @@
+{
+  "_comment": "Metrics the predictive layer watches. 'direction' is which way is bad: 'above' means predict when the metric will exceed limit, 'below' means predict when it will drop below limit. horizon_hours caps how far into the future a prediction is allowed to look -- forecasts further out than this are too uncertain to act on, so predictor.py drops them rather than showing a false sense of precision.",
+
+  "active_connections": {
+    "limit": 110,
+    "direction": "above",
+    "horizon_hours": 24,
+    "description": "DB connection pool is expected to hit its cap"
+  },
+  "error_rate": {
+    "limit": 0.15,
+    "direction": "above",
+    "horizon_hours": 12,
+    "description": "Error rate is trending toward an unacceptable level"
+  },
+  "avg_latency_ms": {
+    "limit": 400,
+    "direction": "above",
+    "horizon_hours": 12,
+    "description": "Average latency is trending toward a user-visible slowdown"
+  },
+  "p95_latency_ms": {
+    "limit": 1200,
+    "direction": "above",
+    "horizon_hours": 12,
+    "description": "Tail latency is trending toward SLA breach"
+  }
+}
